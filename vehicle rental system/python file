@@ -1,0 +1,1068 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from abc import ABC, abstractmethod
+import sqlite3, hashlib, re, os, sys #haslib(atore passoword into text form)
+from datetime import datetime
+
+# EXCEPTIONS
+class VRSError(Exception):
+    def __init__(self, msg): self.message = msg; super().__init__(msg)
+class AuthError(VRSError): pass
+class BadCredentials(AuthError): pass #raised for wring email,password
+class AccountLocked(AuthError): pass  #raised when user enter wrong pass(3)
+class DuplicateUser(AuthError): pass  #raised when tries register already registerid
+class WeakPassword(AuthError): pass   #raised when it doesn't fit pass validation
+class ValidationError(VRSError): pass #raised for unvalide valdation
+class BadEmail(ValidationError): pass
+class BadPhone(ValidationError): pass
+class BadLicense(ValidationError): pass
+class VehicleError(VRSError): pass
+class VehicleNotFound(VehicleError): pass
+class NotAvailable(VehicleError): pass
+class DuplicateReg(VehicleError): pass
+class RentalError(VRSError): pass
+class RentalNotFound(RentalError): pass
+class AlreadyReturned(RentalError): pass
+class BadDateRange(RentalError): pass
+class DBError(VRSError): pass
+
+# MODELS
+class Vehicle(ABC): #abstract base
+    def __init__(self, vehicle_id, brand_model, reg_number, year, color, #constructor
+                 fuel_type, rate_per_day, security_dep, status="available"):
+        self._vid = vehicle_id; self._brand = brand_model; self._reg = reg_number
+        self._year = year; self._color = color; self._fuel = fuel_type
+        self._rate = rate_per_day; self._dep = security_dep; self._status = status
+
+    @abstractmethod
+    def get_type(self): pass
+    @abstractmethod
+    def capacity_label(self): pass
+    @abstractmethod
+    def insurance(self): pass
+
+    def daily_total(self): return self._rate + self.insurance() #calculate daily cost
+    def info(self):
+        return {"vehicle_id": self._vid, "vehicle_type": self.get_type(),
+                "brand_model": self._brand, "reg_number": self._reg,
+                "year": self._year, "color": self._color, "fuel_type": self._fuel,
+                "capacity_label": self.capacity_label(), "rate_per_day": self._rate,
+                "insurance": self.insurance(), "security_dep": self._dep, "status": self._status}
+
+    @property
+    def vehicle_id(self): return self._vid
+    @property
+    def brand_model(self): return self._brand
+    @property
+    def rate_per_day(self): return self._rate
+    @property
+    def security_dep(self): return self._dep
+    @property
+    def status(self): return self._status
+    @status.setter # allow changes status
+    def status(self, v): self._status = v
+    def __str__(self): return f"{self.get_type()} | {self._brand} | {self._reg} | Rs.{self._rate}/day"
+
+class Car(Vehicle): #vehicle-PI, car-CI
+    def __init__(self, capacity=5, **kw): super().__init__(**kw); self._cap = capacity
+    def get_type(self): return "Car"
+    def capacity_label(self): return f"{self._cap} Seater"
+    def insurance(self): return 50 + self._cap * 5 #polymorphism-same method
+
+class Bike(Vehicle):
+    def __init__(self, capacity=150, **kw): super().__init__(**kw); self._cap = capacity
+    def get_type(self): return "Bike"
+    def capacity_label(self): return f"{self._cap} CC Engine"
+    def insurance(self): return 20 + self._cap * 0.05
+
+class Truck(Vehicle):
+    def __init__(self, capacity=1.0, **kw): super().__init__(**kw); self._cap = capacity
+    def get_type(self): return "Truck"
+    def capacity_label(self): return f"{self._cap} Ton Payload"
+    def insurance(self): return 100 + self._cap * 50
+
+def make_vehicle(row): #read db row & creates correct V object
+    t = row.get("vehicle_type","").lower()
+    c = {"vehicle_id": row["vehicle_id"], "brand_model": row["brand_model"],
+         "reg_number": row["reg_number"], "year": row["year"], "color": row["color"],
+         "fuel_type": row["fuel_type"], "rate_per_day": row["rate_per_day"],
+         "security_dep": row["security_dep"], "status": row.get("status","available")}
+    cap = row.get("capacity", 5) #return value
+    if t == "car":   return Car(capacity=cap, **c)
+    if t == "bike":  return Bike(capacity=cap, **c)
+    if t == "truck": return Truck(capacity=cap, **c)
+    raise ValueError(f"Unknown type: {t}")
+
+class User: #create a customer deatils
+    def __init__(self, customer_id, full_name, email, phone, license_no, role="user"):
+        self.customer_id = customer_id; self.full_name = full_name
+        self.email = email; self.phone = phone
+        self.license_no = license_no; self.role = role
+
+class Admin(User):
+    def __init__(self, admin_id, name):
+        super().__init__(admin_id, name, "", "", "", "admin")
+        self.admin_id = admin_id
+
+# DATABASE
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vrs.db")
+
+def conn():
+    try:
+        c = sqlite3.connect(DB, timeout=10); c.row_factory = sqlite3.Row
+        c.execute("PRAGMA foreign_keys=ON"); return c
+    except sqlite3.Error as e: raise DBError(f"DB connect failed: {e}")
+
+def init_db():
+    try:
+        db = conn(); db.executescript("""
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id TEXT UNIQUE NOT NULL, full_name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL, phone TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL, license_no TEXT UNIQUE NOT NULL,
+                role TEXT DEFAULT 'user', created_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS vehicles(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vehicle_id TEXT UNIQUE NOT NULL, vehicle_type TEXT NOT NULL,
+                brand_model TEXT NOT NULL, reg_number TEXT UNIQUE NOT NULL,
+                year INTEGER NOT NULL, color TEXT NOT NULL, fuel_type TEXT NOT NULL,
+                capacity REAL NOT NULL, rate_per_day REAL NOT NULL,
+                security_dep REAL NOT NULL, status TEXT DEFAULT 'available',
+                added_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS rentals(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rental_id TEXT UNIQUE NOT NULL, customer_id TEXT NOT NULL,
+                vehicle_id TEXT NOT NULL, start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL, return_date TEXT, total_days INTEGER NOT NULL,
+                base_charge REAL NOT NULL, late_fee REAL DEFAULT 0,
+                security_dep REAL NOT NULL, total_amount REAL NOT NULL,
+                status TEXT DEFAULT 'active', created_at TEXT DEFAULT(datetime('now')),
+                FOREIGN KEY(customer_id) REFERENCES users(customer_id),
+                FOREIGN KEY(vehicle_id) REFERENCES vehicles(vehicle_id));
+            CREATE TABLE IF NOT EXISTS admins(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, password TEXT NOT NULL);
+        """)
+        cur = db.cursor()
+        if cur.execute("SELECT COUNT(*) FROM admins").fetchone()[0] == 0:
+            db.execute("INSERT INTO admins VALUES(NULL,?,?,?)",
+                       ("ADMIN-001","Super Admin", hashlib.sha256(b"Admin@123").hexdigest()))
+        if cur.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0] == 0:
+            db.executemany(
+                "INSERT INTO vehicles VALUES(NULL,?,?,?,?,?,?,?,?,?,?,'available',datetime('now'))",
+                [("VEH-1001","car","Toyota Camry","GJ01AB1234",2022,"White","Petrol",5,1500,3000),
+                 ("VEH-1002","car","Honda City","MH02CD5678",2021,"Silver","Petrol",5,1200,2500),
+                 ("VEH-1003","bike","Royal Enfield","GJ05ZZ9999",2023,"Black","Petrol",350,600,1000),
+                 ("VEH-1004","bike","KTM Duke","DL03EF1122",2022,"Orange","Petrol",200,500,800),
+                 ("VEH-1005","truck","Tata Ace","UP32GH4455",2020,"Blue","Diesel",1.5,3000,5000)])
+        db.commit(); db.close()
+    except sqlite3.Error as e: raise DBError(f"DB init failed: {e}")
+
+# AUTH SERVICE
+_attempts = {}
+MAX_ATT = 3 # it allowe 3email enter
+
+def hsh(p): return hashlib.sha256(p.encode()).hexdigest()
+def vpass(plain, h): return hsh(plain) == h #check the p valdition match
+
+def chk_password(p): #password strength checking
+    if len(p) < 8: raise WeakPassword("Min 8 characters.")
+    if not re.search(r"[A-Z]", p): raise WeakPassword("Need uppercase letter.")
+    if not re.search(r"[a-z]", p): raise WeakPassword("Need lowercase letter.")
+    if not re.search(r"\d", p): raise WeakPassword("Need a digit.")
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>/?]", p): raise WeakPassword("Need a special character.")
+
+def chk_email(e):
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", e): raise BadEmail(f"Invalid email: {e}")
+def chk_phone(p):
+    if not re.match(r"^\d{10}$", p): raise BadPhone("Phone must be 10 digits.")
+def chk_license(l): pass  # validation removed
+
+def register(full_name, email, phone, license_no, password, confirm):
+    chk_email(email.strip()); chk_phone(phone.strip())
+    chk_license(license_no.strip()); chk_password(password)
+    if password != confirm: raise ValidationError("Passwords do not match.")
+    db = conn() #register valdation need
+    try:
+        cur = db.cursor()#pop message for register
+        if cur.execute("SELECT 1 FROM users WHERE email=?", (email.lower(),)).fetchone():
+            raise DuplicateUser("Email already registered.")
+        if cur.execute("SELECT 1 FROM users WHERE phone=?", (phone,)).fetchone():
+            raise DuplicateUser("Phone already registered.")
+        if cur.execute("SELECT 1 FROM users WHERE license_no=?", (license_no.upper(),)).fetchone():
+            raise DuplicateUser("License already registered.")
+        cid = f"CUST-{1001 + cur.execute('SELECT COUNT(*) FROM users').fetchone()[0]}"
+        db.execute("INSERT INTO users(customer_id,full_name,email,phone,password,license_no,role)"
+                   " VALUES(?,?,?,?,?,?,'user')",
+                   (cid, full_name.strip(), email.lower(), phone.strip(), hsh(password), license_no.upper()))
+        db.commit(); return cid
+    except (DuplicateUser, ValidationError): raise
+    except Exception as e: raise DBError(f"Register failed: {e}")
+    finally: db.close()
+
+def login_user(email, password):
+    k = email.lower()
+    if _attempts.get(k, 0) >= MAX_ATT: raise AccountLocked("Account locked (3 fails).")
+    db = conn()
+    try:
+        row = db.execute("SELECT * FROM users WHERE email=? AND role='user'", (k,)).fetchone()
+        if row and vpass(password, row["password"]):
+            _attempts[k] = 0; return dict(row)
+        _attempts[k] = _attempts.get(k, 0) + 1
+        raise BadCredentials(f"Wrong credentials. {MAX_ATT - _attempts[k]} left.")
+    finally: db.close()
+
+def login_admin(admin_id, password):
+    k = f"adm_{admin_id}"
+    if _attempts.get(k, 0) >= MAX_ATT: raise AccountLocked("Admin locked (3 fails).")
+    db = conn()
+    try:
+        row = db.execute("SELECT * FROM admins WHERE admin_id=?", (admin_id.upper(),)).fetchone()
+        if row and vpass(password, row["password"]):
+            _attempts[k] = 0; return dict(row)
+        _attempts[k] = _attempts.get(k, 0) + 1
+        raise BadCredentials(f"Wrong credentials. {MAX_ATT - _attempts[k]} left.")
+    finally: db.close()
+
+# VEHICLE SERVICE- valdation for vehicle rental
+def _next_vid():
+    db = conn()
+    n = db.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]; db.close()
+    return f"VEH-{1001 + n}"
+
+def add_vehicle(vtype, brand, reg, year, color, fuel, cap, rate, dep):
+    if not brand.strip(): raise ValidationError("Brand cannot be empty.")
+    if not re.match(r"^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$", reg.upper()):
+        raise ValidationError("Reg format: GJ01AB1234")
+    db = conn()
+    try:
+        if db.execute("SELECT 1 FROM vehicles WHERE reg_number=?", (reg.upper(),)).fetchone():
+            raise DuplicateReg(f"Reg '{reg}' already exists.")
+        vid = _next_vid()
+        db.execute("INSERT INTO vehicles(vehicle_id,vehicle_type,brand_model,reg_number,year,"
+                   "color,fuel_type,capacity,rate_per_day,security_dep,status) VALUES(?,?,?,?,?,?,?,?,?,?,'available')",
+                   (vid, vtype.lower(), brand.strip(), reg.upper(), int(year),
+                    color.strip(), fuel.lower(), float(cap), float(rate), float(dep)))
+        db.commit(); return vid
+    except (DuplicateReg, ValidationError): raise
+    except Exception as e: raise DBError(f"Add vehicle failed: {e}")
+    finally: db.close()
+
+def get_vehicles(status=None):
+    db = conn()
+    q = "SELECT * FROM vehicles" + (" WHERE status=?" if status else "") + " ORDER BY id"
+    rows = [dict(r) for r in db.execute(q, (status,) if status else ()).fetchall()]
+    db.close(); return [make_vehicle(r) for r in rows]
+
+def get_vehicle(vid):
+    db = conn()
+    row = db.execute("SELECT * FROM vehicles WHERE vehicle_id=?", (vid,)).fetchone()
+    db.close()
+    if not row: raise VehicleNotFound(f"Vehicle '{vid}' not found.")
+    return make_vehicle(dict(row))
+
+def set_vstatus(vid, s):
+    db = conn(); db.execute("UPDATE vehicles SET status=? WHERE vehicle_id=?", (s, vid))
+    db.commit(); db.close()
+
+def del_vehicle(vid):
+    db = conn()
+    if db.execute("SELECT COUNT(*) FROM rentals WHERE vehicle_id=? AND status='active'",
+                  (vid,)).fetchone()[0] > 0:
+        db.close(); raise NotAvailable("Cannot delete vehicle with active rental.")
+    db.execute("DELETE FROM vehicles WHERE vehicle_id=?", (vid,))
+    db.commit(); db.close()
+
+# RENTAL SERVICE
+FMT = "%Y-%m-%d"
+def pdate(s): return datetime.strptime(s, FMT)
+def today(): return datetime.now().strftime(FMT)
+
+def _next_rid():
+    db = conn()
+    n = db.execute("SELECT COUNT(*) FROM rentals").fetchone()[0]; db.close()
+    return f"RNT-{2001 + n}"
+
+def create_rental(cid, vid, start, end): #check data valid 
+    try: s, e = pdate(start), pdate(end)
+    except ValueError: raise BadDateRange("Use YYYY-MM-DD format.")
+    if s.date() < datetime.now().date(): raise BadDateRange("Start date cannot be past.")
+    if e <= s: raise BadDateRange("End must be after start.")
+    v = get_vehicle(vid)
+    if v.status != "available": raise NotAvailable(f"'{v.brand_model}' not available.")
+    days = (e - s).days
+    base = days * v.rate_per_day
+    total = base + v.security_dep
+    rid = _next_rid()
+    db = conn()
+    try:
+        db.execute("INSERT INTO rentals(rental_id,customer_id,vehicle_id,start_date,end_date,"
+                   "total_days,base_charge,security_dep,total_amount,status) VALUES(?,?,?,?,?,?,?,?,?,'active')",
+                   (rid, cid, vid, start, end, days, base, v.security_dep, total))
+        db.execute("UPDATE vehicles SET status=? WHERE vehicle_id=?", ("rented", vid))
+        db.commit(); return rid
+    except Exception as e: raise DBError(f"Rental failed: {e}")
+    finally: db.close()
+
+def return_rental(rid):
+    db = conn()
+    try:
+        row = db.execute("SELECT r.*,v.brand_model,v.rate_per_day FROM rentals r "
+                         "JOIN vehicles v ON r.vehicle_id=v.vehicle_id WHERE r.rental_id=?",
+                         (rid,)).fetchone()
+        if not row: raise RentalNotFound(f"Rental '{rid}' not found.")
+        r = dict(row)
+        if r["status"] != "active": raise AlreadyReturned("Already returned.")
+        rd = today()
+        late = max(0, (pdate(rd) - pdate(r["end_date"])).days)
+        fee = late * r["rate_per_day"] * 0.5
+        due = r["base_charge"] + fee
+        db.execute("UPDATE rentals SET status='completed',return_date=?,late_fee=?,total_amount=? WHERE rental_id=?",
+                   (rd, fee, due, rid))
+        db.execute("UPDATE vehicles SET status=? WHERE vehicle_id=?", ("available", r["vehicle_id"]))
+        db.commit()
+        return {"rental_id": rid, "brand_model": r["brand_model"], "start_date": r["start_date"],
+                "end_date": r["end_date"], "return_date": rd, "late_days": late,
+                "base_charge": r["base_charge"], "late_fee": fee,
+                "security_dep": r["security_dep"], "total_due": due}
+    finally: db.close()
+
+def user_rentals(cid):
+    db = conn()
+    rows = db.execute("SELECT r.*,v.brand_model FROM rentals r "
+                      "JOIN vehicles v ON r.vehicle_id=v.vehicle_id "
+                      "WHERE r.customer_id=? ORDER BY r.id DESC", (cid,)).fetchall()
+    db.close(); return [dict(r) for r in rows]
+
+def all_rentals():
+    db = conn()
+    rows = db.execute("SELECT r.*,v.brand_model,u.full_name FROM rentals r "
+                      "JOIN vehicles v ON r.vehicle_id=v.vehicle_id "
+                      "JOIN users u ON r.customer_id=u.customer_id ORDER BY r.id DESC").fetchall()
+    db.close(); return [dict(r) for r in rows]
+
+def all_customers():
+    db = conn()
+    rows = db.execute("SELECT customer_id,full_name,email,phone,license_no,created_at FROM users ORDER BY id").fetchall()
+    db.close(); return [dict(r) for r in rows]
+
+def stats():
+    db = conn(); cur = db.cursor()
+    tv  = cur.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+    av  = cur.execute("SELECT COUNT(*) FROM vehicles WHERE status='available'").fetchone()[0]
+    rv  = cur.execute("SELECT COUNT(*) FROM vehicles WHERE status='rented'").fetchone()[0]
+    tu  = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    ar  = cur.execute("SELECT COUNT(*) FROM rentals WHERE status='active'").fetchone()[0]
+    rev = cur.execute("SELECT COALESCE(SUM(total_amount),0) FROM rentals WHERE status='completed'").fetchone()[0]
+    db.close()
+    return {"total_vehicles": tv, "available": av, "rented": rv,
+            "total_customers": tu, "active_rentals": ar, "total_revenue": rev}
+
+# GUI STYLES  –  only 2 colours: white + navy blue
+BG    = "#ffffff"   # white  – backgrounds
+NAVY  = "#1a3c6e"   # navy   – headers, buttons, highlights
+TXT   = "#111111"   #black text
+MUTE  = "#555555"   #gry text
+LTBG  = "#f0f4fa"   # very light tint of navy (derived, not a third hue)
+ENTRY_BG = "#f8f9fc"
+
+C = {
+    "bg":    BG,
+    "side":  LTBG,
+    "card":  NAVY,
+    "accent":NAVY,
+    "acc2":  NAVY,
+    "ok":    NAVY,
+    "warn":  NAVY,
+    "err":   NAVY,
+    "txt":   TXT,
+    "mute":  MUTE,
+    "ebg":   ENTRY_BG,
+    "efg":   TXT,
+    "w":     BG,
+}
+
+F = {
+    "title": ("Courier New", 20, "bold"),
+    "head":  ("Courier New", 13, "bold"),
+    "sub":   ("Courier New", 10, "bold"),
+    "body":  ("Courier New", 10),
+    "sm":    ("Courier New", 9),
+    "btn":   ("Courier New", 10, "bold"),
+    "mono":  ("Courier New", 10),
+}
+
+def apply_style():
+    s = ttk.Style(); s.theme_use("clam")
+    s.configure("T.Treeview",
+                background=BG, foreground=TXT,
+                fieldbackground=BG, rowheight=24,
+                font=F["body"], borderwidth=1)
+    s.configure("T.Treeview.Heading",
+                background=NAVY, foreground=BG,
+                font=F["sub"], relief="flat", padding=4)
+    s.map("T.Treeview",
+          background=[("selected", NAVY)],
+          foreground=[("selected", BG)])
+
+def btn(p, text, cmd, bg=None, w=None, **kw): #styled button automatically
+    b = tk.Button(p, text=text, command=cmd,
+                  bg=bg or NAVY, fg=BG,
+                  font=F["btn"], relief="solid", bd=1,
+                  cursor="hand2", padx=8, pady=5)
+    if w: b.config(width=w)
+    return b
+
+def lbl(p, text, font=None, fg=None, bg=None, **kw):
+    return tk.Label(p, text=text,
+                    font=font or F["body"],
+                    fg=fg or TXT,
+                    bg=bg or BG, **kw)
+
+def entry(p, var, show=None, w=28): #create text i/p
+    f = tk.Frame(p, bg=NAVY, pady=1, padx=1)
+    e = tk.Entry(f, textvariable=var, show=show,
+                 bg=ENTRY_BG, fg=TXT,
+                 insertbackground=TXT,
+                 relief="flat", font=F["body"], bd=3, width=w)
+    e.pack(fill="x"); return f, e
+
+def tree(p, cols, h=13):
+    apply_style()
+    t = ttk.Treeview(p, columns=cols, show="headings",
+                     style="T.Treeview", height=h, selectmode="browse")
+    for c in cols:
+        t.heading(c, text=c)
+        t.column(c, anchor="center", width=110, minwidth=70)
+    sb = ttk.Scrollbar(p, orient="vertical", command=t.yview)
+    t.configure(yscrollcommand=sb.set)
+    return t, sb
+
+def field_row(p, label, var, row, show=None):
+    lbl(p, label, font=F["body"], fg=MUTE, bg=p["bg"]).grid(
+        row=row, column=0, sticky="w", pady=3, padx=(0, 10))
+    f, e = entry(p, var, show=show)
+    f.grid(row=row, column=1, sticky="ew", pady=3)
+    return e
+
+# BASE WINDOW
+class BaseWin(ABC):
+    def __init__(self, parent, session):
+        self.parent = parent; self.session = session
+        self.frame = tk.Frame(parent, bg=BG) #PC for all GUI
+
+    @abstractmethod
+    def build_ui(self): pass
+    @abstractmethod
+    def refresh(self): pass
+
+    def show(self):    self.frame.pack(fill="both", expand=True)
+    def hide(self):    self.frame.pack_forget()
+    def destroy(self): self.frame.destroy()
+    def err(self, t, m):  messagebox.showerror(t, m)
+    def ok(self, t, m):   messagebox.showinfo(t, m)
+    def ask(self, t, m):  return messagebox.askyesno(t, m)
+
+# LOGIN WINDOW
+class LoginWin(BaseWin):
+    def __init__(self, parent, on_user, on_admin):
+        super().__init__(parent, {})
+        self.on_user = on_user; self.on_admin = on_admin
+        self.on_reg = None; self.build_ui()
+
+    def build_ui(self):
+        self.frame.configure(bg=BG)
+        outer = tk.Frame(self.frame, bg=BG)
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+
+        # left navy panel
+        brand = tk.Frame(outer, bg=NAVY, width=220, padx=20, pady=30)
+        brand.pack(side="left", fill="y"); brand.pack_propagate(False)
+        lbl(brand, "VRS", ("Courier New", 40, "bold"), BG, NAVY).pack(pady=(30, 0))
+        lbl(brand, "Vehicle Rental\nSystem", F["head"], BG, NAVY, justify="center").pack()
+        tk.Frame(brand, bg=BG, height=2, width=80).pack(pady=14)
+        lbl(brand, "Rent. Drive. Return.", F["sm"], BG, NAVY).pack()
+
+        # right white form panel
+        right = tk.Frame(outer, bg=BG, padx=32, pady=24, width=340,
+                         relief="solid", bd=1)
+        right.pack(side="left", fill="both")
+
+        tabs = tk.Frame(right, bg=BG); tabs.pack(fill="x", pady=(0, 14))
+        self._tbtns = {}
+        for txt, val in [("User Login", "user"), ("Admin Login", "admin")]:
+            b = tk.Button(tabs, text=txt, command=lambda v=val: self._tab(v),
+                          font=F["btn"], relief="solid", bd=1, cursor="hand2",
+                          padx=10, pady=5)
+            b.pack(side="left", padx=2); self._tbtns[val] = b
+
+        self._uf = tk.Frame(right, bg=BG); self._build_user(self._uf)
+        self._af = tk.Frame(right, bg=BG); self._build_admin(self._af)
+        self._tab("user")
+
+    def _build_user(self, p):
+        lbl(p, "Welcome Back", F["title"], bg=BG).pack(anchor="w", pady=(0, 2))
+        lbl(p, "Sign in to your account", F["sm"], MUTE, BG).pack(anchor="w", pady=(0, 14))
+        fm = tk.Frame(p, bg=BG); fm.pack(fill="x")
+        self._ue = tk.StringVar(); self._up = tk.StringVar()
+        field_row(fm, "Email", self._ue, 0)
+        field_row(fm, "Password", self._up, 1, show="*")
+        btn(p, "Sign In", self._do_user, w=26).pack(pady=(14, 5))
+        tk.Button(p, text="No account? Register",
+                  command=lambda: self.on_reg and self.on_reg(),
+                  bg=BG, fg=NAVY, font=F["sm"], relief="flat", cursor="hand2").pack()
+
+    def _build_admin(self, p):
+        lbl(p, "Admin Access", F["title"], bg=BG).pack(anchor="w", pady=(0, 2))
+        lbl(p, "Default: ADMIN-001 / Admin@123", F["sm"], MUTE, BG).pack(anchor="w", pady=(0, 14))
+        fm = tk.Frame(p, bg=BG); fm.pack(fill="x")
+        self._ai = tk.StringVar(); self._ap = tk.StringVar()
+        field_row(fm, "Admin ID", self._ai, 0)
+        field_row(fm, "Password", self._ap, 1, show="*")
+        btn(p, "Admin Sign In", self._do_admin, w=26).pack(pady=(14, 5))
+
+    def _tab(self, t):
+        for k, b in self._tbtns.items():
+            b.config(bg=NAVY if k == t else BG,
+                     fg=BG  if k == t else NAVY)
+        self._uf.pack_forget(); self._af.pack_forget()
+        (self._uf if t == "user" else self._af).pack(fill="x")
+
+    def _do_user(self):
+        try:
+            e, p = self._ue.get().strip(), self._up.get().strip()
+            if not e or not p: raise ValidationError("Email and password required.")
+            self.on_user(login_user(e, p))
+        except VRSError as ex: self.err("Login Failed", ex.message)
+
+    def _do_admin(self):
+        try:
+            a, p = self._ai.get().strip(), self._ap.get().strip()
+            if not a or not p: raise ValidationError("Admin ID and password required.")
+            self.on_admin(login_admin(a, p))
+        except VRSError as ex: self.err("Login Failed", ex.message)
+
+    def refresh(self):
+        for v in [self._ue, self._up, self._ai, self._ap]: v.set("")
+
+# REGISTER WINDOW
+class RegisterWin(BaseWin):
+    def __init__(self, parent, on_ok, on_back):
+        super().__init__(parent, {})
+        self.on_ok = on_ok; self.on_back = on_back; self.build_ui()
+
+    def build_ui(self):
+        self.frame.configure(bg=BG)
+        outer = tk.Frame(self.frame, bg=BG)
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+
+        card = tk.Frame(outer, bg=BG, padx=40, pady=32,
+                        relief="solid", bd=1); card.pack()
+
+        # navy header bar
+        hdr = tk.Frame(card, bg=NAVY, pady=10); hdr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+        lbl(hdr, "Create New Account", F["title"], BG, NAVY).pack()
+
+        self._n=tk.StringVar(); self._e=tk.StringVar(); self._ph=tk.StringVar()
+        self._l=tk.StringVar(); self._pw=tk.StringVar(); self._cp=tk.StringVar()
+        for row,(ltext,var,sh) in enumerate([
+            ("Full Name",       self._n,  None),
+            ("Email",           self._e,  None),
+            ("Phone (10 digits)",self._ph, None),
+            ("Driving License", self._l,  None),
+            ("Password",        self._pw, "*"),
+            ("Confirm Password",self._cp, "*")], 1):
+            field_row(card, ltext, var, row, show=sh)
+
+        bf = tk.Frame(card, bg=BG); bf.grid(row=7, column=0, columnspan=2, pady=(18, 0))
+        btn(bf, "Register", self._do_reg, w=16).pack(side="left", padx=6)
+        btn(bf, "Back",     self.on_back, w=14).pack(side="left", padx=6)
+        lbl(card, "Pass: 8+ chars, A-Z, a-z, 0-9, special",
+            F["sm"], MUTE, BG).grid(row=8, column=0, columnspan=2, pady=(8, 0), sticky="w")
+
+    def _do_reg(self):
+        try:
+            cid = register(self._n.get(), self._e.get(), self._ph.get(),
+                           self._l.get(), self._pw.get(), self._cp.get())
+            self.ok("Registered!", f"Success! Customer ID: {cid}\nPlease login.")
+            self.refresh(); self.on_ok()
+        except VRSError as ex: self.err("Failed", ex.message)
+
+    def refresh(self):
+        for v in [self._n, self._e, self._ph, self._l, self._pw, self._cp]: v.set("")
+
+# USER DASHBOARD
+class UserDash(BaseWin):
+    def __init__(self, parent, session, on_logout):
+        super().__init__(parent, session)
+        self.on_logout = on_logout; self._pages={}; self._active=None; self.build_ui()
+
+    def build_ui(self):
+        self.frame.configure(bg=BG)
+        sb = tk.Frame(self.frame, bg=LTBG, width=200, relief="solid", bd=1)
+        sb.pack(side="left", fill="y"); sb.pack_propagate(False)
+        self._mk_sidebar(sb)
+        self._ct = tk.Frame(self.frame, bg=BG)
+        self._ct.pack(side="left", fill="both", expand=True)
+        self._pages = {"v": self._pg_vehicles(), "a": self._pg_active(),
+                       "r": self._pg_return(),   "h": self._pg_history()}
+        self._go("v")
+
+    def _mk_sidebar(self, sb):
+        lo = tk.Frame(sb, bg=NAVY, pady=14); lo.pack(fill="x")
+        lbl(lo, "VRS", ("Courier New", 22, "bold"), BG, NAVY).pack()
+        lbl(lo, "User Panel", F["sm"], BG, NAVY).pack()
+
+        nf = tk.Frame(sb, bg=LTBG, pady=8, padx=10); nf.pack(fill="x")
+        lbl(nf, self.session.get("full_name", "User"), F["sub"], bg=LTBG, wraplength=160).pack(anchor="w")
+        lbl(nf, self.session.get("customer_id", ""), F["sm"], MUTE, LTBG).pack(anchor="w")
+        tk.Frame(sb, bg=NAVY, height=1).pack(fill="x")
+
+        self._nb = {}
+        for txt, k in [("Browse Vehicles","v"),("Active Rentals","a"),
+                       ("Return Vehicle","r"), ("History","h")]:
+            b = tk.Button(sb, text=f"  {txt}", command=lambda x=k: self._go(x),
+                          bg=LTBG, fg=TXT, font=F["body"],
+                          relief="flat", anchor="w", cursor="hand2", padx=10, pady=8)
+            b.pack(fill="x"); self._nb[k] = b
+
+        tk.Frame(sb, bg=LTBG).pack(expand=True, fill="y")
+        btn(sb, "  Logout", self._logout).pack(fill="x")
+
+    def _go(self, k):
+        for f in self._pages.values(): f.pack_forget()
+        self._pages[k].pack(fill="both", expand=True); self._active = k
+        for x, b in self._nb.items():
+            b.config(bg=NAVY if x==k else LTBG, fg=BG if x==k else TXT)
+        self.refresh()
+
+    def _pg_vehicles(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "Available Vehicles", F["title"], BG, NAVY).pack(side="left")
+
+        ff = tk.Frame(pg, bg=BG, pady=6, padx=12); ff.pack(fill="x")
+        lbl(ff, "Filter:", F["body"], MUTE, BG).pack(side="left", padx=(0,4))
+        self._vf = tk.StringVar(value="All")
+        for v in ["All","Car","Bike","Truck"]:
+            tk.Radiobutton(ff, text=v, variable=self._vf, value=v,
+                           command=self._load_vehicles, bg=BG, fg=TXT,
+                           selectcolor=NAVY, activebackground=BG,
+                           font=F["body"]).pack(side="left", padx=5)
+
+        tf = tk.Frame(pg, bg=BG, padx=12); tf.pack(fill="both", expand=True)
+        cols = ("ID","Type","Brand","Year","Color","Fuel","Capacity","Rate/Day","Insurance","Status")
+        self._vt, sb = tree(tf, cols, 11)
+        self._vt.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+
+        rc = tk.Frame(pg, bg=LTBG, padx=16, pady=10, relief="solid", bd=1)
+        rc.pack(fill="x", padx=12, pady=6)
+        lbl(rc, "Rent Selected Vehicle", F["sub"], bg=LTBG).grid(row=0,column=0,columnspan=5,sticky="w",pady=(0,6))
+        self._rv=tk.StringVar(); self._rs=tk.StringVar(); self._re=tk.StringVar()
+        for c, (t, v) in enumerate([("Vehicle ID",self._rv),("Start (YYYY-MM-DD)",self._rs),("End (YYYY-MM-DD)",self._re)]):
+            lbl(rc, t, F["sm"], MUTE, LTBG).grid(row=1, column=c*2, sticky="w", padx=(0,4))
+            f, _ = entry(rc, v, w=13); f.grid(row=1, column=c*2+1, padx=(0,8))
+        btn(rc, "Confirm Rent", self._do_rent).grid(row=1, column=6, padx=(4,0))
+        self._vt.bind("<<TreeviewSelect>>", lambda e: self._rv.set(
+            self._vt.item(self._vt.focus(),"values")[0]
+            if self._vt.focus() and self._vt.item(self._vt.focus(),"values") else ""))
+        return pg
+
+    def _pg_active(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "My Active Rentals", F["title"], BG, NAVY).pack(side="left")
+        tf = tk.Frame(pg, bg=BG, padx=12, pady=6); tf.pack(fill="both", expand=True)
+        cols=("Rental ID","Vehicle","Start","End","Days","Charge","Security","Total","Status")
+        self._at, sb = tree(tf, cols)
+        self._at.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
+        return pg
+
+    def _pg_return(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "Return a Vehicle", F["title"], BG, NAVY).pack(side="left")
+
+        fm = tk.Frame(pg, bg=BG, padx=26, pady=20); fm.pack()
+        lbl(fm, "Enter your Rental ID to return:", F["sub"], bg=BG).pack(anchor="w", pady=(0,10))
+        rr = tk.Frame(fm, bg=BG); rr.pack(anchor="w")
+        lbl(rr, "Rental ID:", F["body"], MUTE, BG).pack(side="left", padx=(0,6))
+        self._rid = tk.StringVar()
+        f, _ = entry(rr, self._rid, w=16); f.pack(side="left")
+        btn(fm, "Process Return", self._do_return).pack(anchor="w", pady=12)
+
+        ic = tk.Frame(pg, bg=LTBG, padx=16, pady=14, relief="solid", bd=1)
+        ic.pack(fill="x", padx=26)
+        self._inv = tk.Text(ic, bg=LTBG, fg=TXT, font=F["mono"],
+                            height=12, relief="flat", state="disabled", wrap="none")
+        self._inv.pack(fill="x")
+        return pg
+
+    def _pg_history(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "Rental History", F["title"], BG, NAVY).pack(side="left")
+        tf = tk.Frame(pg, bg=BG, padx=12, pady=6); tf.pack(fill="both", expand=True)
+        cols=("Rental ID","Vehicle","Start","End","Returned","Days","Total","Status")
+        self._ht, sb = tree(tf, cols)
+        self._ht.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
+        return pg
+
+    def _load_vehicles(self):
+        for r in self._vt.get_children(): self._vt.delete(r)
+        flt = self._vf.get()
+        for v in get_vehicles("available"):
+            i = v.info()
+            if flt!="All" and i["vehicle_type"]!=flt: continue
+            self._vt.insert("","end", values=(
+                i["vehicle_id"], i["vehicle_type"], i["brand_model"], i["year"],
+                i["color"], i["fuel_type"].title(), i["capacity_label"],
+                f"Rs.{i['rate_per_day']:.0f}", f"Rs.{i['insurance']:.0f}", i["status"].title()))
+
+    def _do_rent(self):
+        try:
+            v,s,e = self._rv.get().strip().upper(), self._rs.get().strip(), self._re.get().strip()
+            if not v or not s or not e: raise ValidationError("All rent fields required.")
+            rid = create_rental(self.session["customer_id"], v, s, e)
+            self.ok("Confirmed", f"Rental created!\nRental ID: {rid}")
+            for x in [self._rv,self._rs,self._re]: x.set("")
+            self._load_vehicles()
+        except VRSError as ex: self.err("Failed", ex.message)
+
+    def _do_return(self):
+        try:
+            rid = self._rid.get().strip().upper()
+            if not rid: raise ValidationError("Enter a Rental ID.")
+            if not self.ask("Confirm", f"Return rental {rid}?"): return
+            inv = return_rental(rid)
+            late_ln = (f"  Late Days : {inv['late_days']} day(s)\n"
+                       f"  Late Fee  : Rs.{inv['late_fee']:.2f}\n"
+                       if inv["late_days"]>0 else
+                       "  Late Fee  : Rs.0.00 (on time)\n")
+            txt = (f"{'='*40}\n  RETURN INVOICE\n{'='*40}\n"
+                   f"  Rental ID : {inv['rental_id']}\n"
+                   f"  Vehicle   : {inv['brand_model']}\n"
+                   f"  Rented On : {inv['start_date']}\n"
+                   f"  Due Date  : {inv['end_date']}\n"
+                   f"  Returned  : {inv['return_date']}\n"
+                   f"{'-'*40}\n"
+                   f"  Base      : Rs.{inv['base_charge']:.2f}\n"
+                   f"{late_ln}"
+                   f"  Security  : Rs.{inv['security_dep']:.2f} (Refunded)\n"
+                   f"{'-'*40}\n"
+                   f"  TOTAL DUE : Rs.{inv['total_due']:.2f}\n{'='*40}\n")
+            self._inv.config(state="normal"); self._inv.delete("1.0","end")
+            self._inv.insert("end", txt); self._inv.config(state="disabled")
+            self._rid.set("")
+        except VRSError as ex: self.err("Failed", ex.message)
+
+    def _logout(self):
+        if self.ask("Logout","Are you sure?"): self.on_logout()
+
+    def refresh(self):
+        if self._active=="v": self._load_vehicles()
+        elif self._active=="a": self._load_active()
+        elif self._active=="h": self._load_history()
+
+    def _load_active(self):
+        for r in self._at.get_children(): self._at.delete(r)
+        for r in user_rentals(self.session["customer_id"]):
+            if r["status"]=="active":
+                self._at.insert("","end", values=(
+                    r["rental_id"],r["brand_model"],r["start_date"],r["end_date"],
+                    r["total_days"],f"{r['base_charge']:.2f}",f"{r['security_dep']:.2f}",
+                    f"{r['total_amount']:.2f}",r["status"].title()))
+
+    def _load_history(self):
+        for r in self._ht.get_children(): self._ht.delete(r)
+        for r in user_rentals(self.session["customer_id"]):
+            self._ht.insert("","end", values=(
+                r["rental_id"],r["brand_model"],r["start_date"],r["end_date"],
+                r.get("return_date") or "-",r["total_days"],
+                f"{r['total_amount']:.2f}",r["status"].title()))
+
+# ADMIN DASHBOARD
+class AdminDash(BaseWin):
+    def __init__(self, parent, session, on_logout):
+        super().__init__(parent, session)
+        self.on_logout = on_logout; self._pages={}; self._active=None; self.build_ui()
+
+    def build_ui(self):
+        self.frame.configure(bg=BG)
+        sb = tk.Frame(self.frame, bg=LTBG, width=200, relief="solid", bd=1)
+        sb.pack(side="left", fill="y"); sb.pack_propagate(False)
+        self._mk_sidebar(sb)
+        self._ct = tk.Frame(self.frame, bg=BG)
+        self._ct.pack(side="left", fill="both", expand=True)
+        self._pages = {"d":self._pg_dash(), "v":self._pg_vehicles(),
+                       "a":self._pg_add(), "r":self._pg_rentals(), "c":self._pg_customers()}
+        self._go("d")
+
+    def _mk_sidebar(self, sb):
+        lo = tk.Frame(sb, bg=NAVY, pady=14); lo.pack(fill="x")
+        lbl(lo, "VRS", ("Courier New", 22, "bold"), BG, NAVY).pack()
+        lbl(lo, "Admin Panel", F["sm"], BG, NAVY).pack()
+
+        nf = tk.Frame(sb, bg=LTBG, pady=8, padx=10); nf.pack(fill="x")
+        lbl(nf, self.session.get("name","Admin"), F["sub"], bg=LTBG, wraplength=160).pack(anchor="w")
+        lbl(nf, self.session.get("admin_id",""), F["sm"], MUTE, LTBG).pack(anchor="w")
+        tk.Frame(sb, bg=NAVY, height=1).pack(fill="x")
+
+        self._nb = {}
+        for txt,k in [("Dashboard","d"),("Manage Vehicles","v"),
+                      ("Add Vehicle","a"),("All Rentals","r"),("Customers","c")]:
+            b = tk.Button(sb, text=f"  {txt}", command=lambda x=k: self._go(x),
+                          bg=LTBG, fg=TXT, font=F["body"],
+                          relief="flat", anchor="w", cursor="hand2", padx=10, pady=8)
+            b.pack(fill="x"); self._nb[k] = b
+
+        tk.Frame(sb, bg=LTBG).pack(expand=True, fill="y")
+        btn(sb, "  Logout", self._logout).pack(fill="x")
+
+    def _go(self, k):
+        for f in self._pages.values(): f.pack_forget()
+        self._pages[k].pack(fill="both", expand=True); self._active = k
+        for x, b in self._nb.items():
+            b.config(bg=NAVY if x==k else LTBG, fg=BG if x==k else TXT)
+        self.refresh()
+
+    def _pg_dash(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "System Dashboard", F["title"], BG, NAVY).pack(side="left")
+
+        sf = tk.Frame(pg, bg=BG, padx=16, pady=14); sf.pack(fill="x")
+        self._sl = {}
+        for i,(k,t) in enumerate([
+            ("total_vehicles","Total Vehicles"), ("available","Available"),
+            ("rented","Rented"),               ("total_customers","Customers"),
+            ("active_rentals","Active Rentals"),("total_revenue","Revenue Rs")]):
+            cd = tk.Frame(sf, bg=NAVY, padx=14, pady=12, width=148)
+            cd.grid(row=0, column=i, padx=5, pady=5, sticky="ew")
+            cd.grid_propagate(False)
+            vl = lbl(cd, "0", ("Courier New",20,"bold"), BG, NAVY); vl.pack()
+            lbl(cd, t, F["sm"], BG, NAVY).pack()
+            self._sl[k] = vl
+
+        rh = tk.Frame(pg, bg=BG, padx=16); rh.pack(fill="x", pady=(6,2))
+        lbl(rh, "Recent Rentals", F["sub"]).pack(side="left")
+        tf = tk.Frame(pg, bg=BG, padx=16); tf.pack(fill="both", expand=True)
+        cols=("Rental ID","Customer","Vehicle","Start","End","Total","Status")
+        self._rt, sb = tree(tf, cols, 8)
+        self._rt.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
+        return pg
+
+    def _pg_vehicles(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "All Vehicles", F["title"], BG, NAVY).pack(side="left")
+        btn(hd, "Add New", lambda: self._go("a")).pack(side="right")
+
+        ff = tk.Frame(pg, bg=BG, pady=5, padx=12); ff.pack(fill="x")
+        lbl(ff, "Filter:", F["body"], MUTE, BG).pack(side="left", padx=(0,4))
+        self._avf = tk.StringVar(value="All")
+        for v in ["All","Car","Bike","Truck","available","rented"]:
+            tk.Radiobutton(ff, text=v.title(), variable=self._avf, value=v,
+                           command=self._load_vehicles, bg=BG, fg=TXT,
+                           selectcolor=NAVY, activebackground=BG,
+                           font=F["sm"]).pack(side="left", padx=3)
+
+        tf = tk.Frame(pg, bg=BG, padx=12); tf.pack(fill="both", expand=True)
+        cols=("ID","Type","Brand","Reg No","Year","Fuel","Capacity","Rate","Security","Status")
+        self._avt, sb = tree(tf, cols)
+        self._avt.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
+
+        db = tk.Frame(pg, bg=BG, padx=12, pady=5); db.pack(fill="x")
+        lbl(db, "Delete ID:", F["body"], MUTE, BG).pack(side="left", padx=(0,5))
+        self._dv = tk.StringVar()
+        f,_ = entry(db, self._dv, w=12); f.pack(side="left", padx=(0,7))
+        btn(db, "Delete Vehicle", self._do_del).pack(side="left")
+        self._avt.bind("<<TreeviewSelect>>", lambda e: self._dv.set(
+            self._avt.item(self._avt.focus(),"values")[0]
+            if self._avt.focus() and self._avt.item(self._avt.focus(),"values") else ""))
+        return pg
+
+    def _pg_add(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "Add New Vehicle", F["title"], BG, NAVY).pack(side="left")
+
+        outer = tk.Frame(pg, bg=BG); outer.pack(fill="both", expand=True)
+        fm = tk.Frame(outer, bg=BG, padx=32, pady=22,
+                      relief="solid", bd=1); fm.pack(pady=14)
+
+        self._ft=tk.StringVar(value="car"); self._fb=tk.StringVar(); self._fr=tk.StringVar()
+        self._fy=tk.StringVar(); self._fc=tk.StringVar(); self._ff=tk.StringVar(value="petrol")
+        self._fcp=tk.StringVar(); self._frt=tk.StringVar(); self._fd=tk.StringVar()
+
+        lbl(fm, "Type:", F["body"], MUTE, BG).grid(row=0,column=0,sticky="w",pady=4,padx=(0,10))
+        tf = tk.Frame(fm, bg=BG); tf.grid(row=0, column=1, sticky="w")
+        for v in ["car","bike","truck"]:
+            tk.Radiobutton(tf, text=v.title(), variable=self._ft, value=v,
+                           bg=BG, fg=TXT, selectcolor=NAVY, activebackground=BG,
+                           font=F["body"]).pack(side="left", padx=6)
+
+        for row,(txt,var) in enumerate([
+            ("Brand & Model:",self._fb), ("Reg Number:",self._fr),
+            ("Year:",self._fy),          ("Color:",self._fc),
+            ("Capacity (seats/cc/ton):",self._fcp),
+            ("Rate/Day (Rs):",self._frt), ("Security Dep (Rs):",self._fd)], 1):
+            field_row(fm, txt, var, row)
+
+        lbl(fm,"Fuel:",F["body"],MUTE,BG).grid(row=8,column=0,sticky="w",pady=4,padx=(0,10))
+        ff2 = tk.Frame(fm, bg=BG); ff2.grid(row=8, column=1, sticky="w")
+        for v in ["petrol","diesel","electric","cng","hybrid"]:
+            tk.Radiobutton(ff2, text=v.title(), variable=self._ff, value=v,
+                           bg=BG, fg=TXT, selectcolor=NAVY, activebackground=BG,
+                           font=F["body"]).pack(side="left", padx=4)
+
+        bf = tk.Frame(fm, bg=BG); bf.grid(row=9,column=0,columnspan=2,pady=(16,0))
+        btn(bf,"Add Vehicle",self._do_add,w=16).pack(side="left",padx=6)
+        btn(bf,"Clear",self._clr,w=12).pack(side="left",padx=6)
+        lbl(fm,"Reg format: GJ01AB1234 | Year: 1990-present",F["sm"],MUTE,BG).grid(
+            row=10,column=0,columnspan=2,pady=(6,0))
+        return pg
+
+    def _pg_rentals(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "All Rentals", F["title"], BG, NAVY).pack(side="left")
+        tf = tk.Frame(pg, bg=BG, padx=12, pady=6); tf.pack(fill="both", expand=True)
+        cols=("Rental ID","Customer","Vehicle","Start","End","Returned","Days","Charge","Fee","Total","Status")
+        self._rnt, sb = tree(tf, cols)
+        self._rnt.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
+        return pg
+
+    def _pg_customers(self):
+        pg = tk.Frame(self._ct, bg=BG)
+        hd = tk.Frame(pg, bg=NAVY, padx=16, pady=10); hd.pack(fill="x")
+        lbl(hd, "Registered Customers", F["title"], BG, NAVY).pack(side="left")
+        tf = tk.Frame(pg, bg=BG, padx=12, pady=6); tf.pack(fill="both", expand=True)
+        cols=("Customer ID","Full Name","Email","Phone","License","Joined")
+        self._ct2, sb = tree(tf, cols)
+        self._ct2.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
+        return pg
+
+    def _load_vehicles(self):
+        for r in self._avt.get_children(): self._avt.delete(r)
+        flt = self._avf.get()
+        for v in get_vehicles():
+            i = v.info()
+            if flt!="All":
+                if flt in ("available","rented") and i["status"].lower()!=flt: continue
+                if flt in ("Car","Bike","Truck") and i["vehicle_type"]!=flt: continue
+            self._avt.insert("","end", values=(
+                i["vehicle_id"],i["vehicle_type"],i["brand_model"],i["reg_number"],
+                i["year"],i["fuel_type"].title(),i["capacity_label"],
+                f"Rs.{i['rate_per_day']:.0f}",f"Rs.{i['security_dep']:.0f}",i["status"].title()))
+
+    def _do_add(self):
+        try:
+            cp,rt,dp,yr = self._fcp.get().strip(),self._frt.get().strip(),self._fd.get().strip(),self._fy.get().strip()
+            if not all([cp,rt,dp,yr,self._fb.get().strip(),self._fr.get().strip()]):
+                raise ValidationError("All fields required.")
+            try: cp,rt,dp,yr = float(cp),float(rt),float(dp),int(yr)
+            except ValueError: raise ValidationError("Capacity, rate, deposit, year must be numbers.")
+            if rt<=0 or dp<=0 or cp<=0: raise ValidationError("Rate, deposit, capacity must be positive.")
+            vid = add_vehicle(self._ft.get(),self._fb.get(),self._fr.get(),yr,
+                              self._fc.get(),self._ff.get(),cp,rt,dp)
+            self.ok("Added", f"Vehicle added! ID: {vid}"); self._clr()
+        except VRSError as ex: self.err("Failed", ex.message)
+
+    def _clr(self):
+        for v in [self._fb,self._fr,self._fy,self._fc,self._fcp,self._frt,self._fd]: v.set("")
+        self._ft.set("car"); self._ff.set("petrol")
+
+    def _do_del(self):
+        vid = self._dv.get().strip().upper()
+        if not vid: self.err("Required","Enter a Vehicle ID."); return
+        try:
+            v = get_vehicle(vid)
+            if not self.ask("Confirm",f"Delete {v.brand_model} ({vid})?"): return
+            del_vehicle(vid); self.ok("Deleted",f"{vid} deleted."); self._dv.set("")
+            self._load_vehicles()
+        except VRSError as ex: self.err("Failed", ex.message)
+
+    def _logout(self):
+        if self.ask("Logout","Are you sure?"): self.on_logout()
+
+    def refresh(self):
+        if self._active=="d": self._load_dash()
+        elif self._active=="v": self._load_vehicles()
+        elif self._active=="r": self._load_rentals()
+        elif self._active=="c": self._load_customers()
+
+    def _load_dash(self):
+        st = stats()
+        for k,l in self._sl.items():
+            v = st.get(k,0); l.config(text=f"{v:.0f}" if isinstance(v,float) else str(v))
+        for r in self._rt.get_children(): self._rt.delete(r)
+        for r in all_rentals()[:10]:
+            self._rt.insert("","end", values=(
+                r["rental_id"],r.get("full_name",""),r.get("brand_model",""),
+                r["start_date"],r["end_date"],
+                f"Rs.{r['total_amount']:.0f}",r["status"].title()))
+
+    def _load_rentals(self):
+        for r in self._rnt.get_children(): self._rnt.delete(r)
+        for r in all_rentals():
+            self._rnt.insert("","end", values=(
+                r["rental_id"],r.get("full_name",""),r.get("brand_model",""),
+                r["start_date"],r["end_date"],r.get("return_date") or "-",r["total_days"],
+                f"Rs.{r['base_charge']:.0f}",f"Rs.{r['late_fee']:.0f}",
+                f"Rs.{r['total_amount']:.0f}",r["status"].title()))
+
+    def _load_customers(self):
+        for r in self._ct2.get_children(): self._ct2.delete(r)
+        for c in all_customers():
+            self._ct2.insert("","end", values=(
+                c["customer_id"],c["full_name"],c["email"],c["phone"],
+                c["license_no"],c["created_at"][:10]))
+
+# APP CONTROLLER
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Vehicle Rental System")
+        self.root.geometry("1200x720")
+        self.root.minsize(1000, 640)
+        self.root.configure(bg=BG)
+        x = self.root.winfo_screenwidth()//2 - 600
+        y = self.root.winfo_screenheight()//2 - 360
+        self.root.geometry(f"1200x720+{x}+{y}")
+        self._win = None
+        try: init_db()
+        except DBError as e: messagebox.showerror("DB Error", e.message); sys.exit(1)
+        self._show_login()
+
+    def _clear(self):
+        if self._win:
+            try: self._win.destroy()
+            except: pass
+        self._win = None
+
+    def _show_login(self):
+        self._clear()
+        w = LoginWin(self.root, self._user_ok, self._admin_ok)
+        w.on_reg = self._show_reg; w.show(); self._win = w
+
+    def _show_reg(self):
+        self._clear()
+        w = RegisterWin(self.root, self._show_login, self._show_login)
+        w.show(); self._win = w
+
+    def _user_ok(self, data):
+        self._clear()
+        w = UserDash(self.root, data, self._show_login)
+        w.show(); self._win = w
+
+    def _admin_ok(self, data):
+        self._clear()
+        w = AdminDash(self.root, data, self._show_login)
+        w.show(); self._win = w
+
+    def run(self): self.root.mainloop()
+
+if __name__ == "__main__":
+    App().run()
